@@ -2,6 +2,7 @@ extern crate byteorder;
 extern crate clap;
 extern crate crossbeam_channel;
 extern crate flate2;
+extern crate geo;
 #[macro_use]
 extern crate itertools;
 #[macro_use]
@@ -11,6 +12,7 @@ extern crate postgres_binary_copy;
 extern crate pretty_env_logger;
 extern crate streaming_iterator;
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;
 use std::iter::Iterator;
@@ -23,8 +25,10 @@ use byteorder::{NetworkEndian, ReadBytesExt};
 use clap::{App, Arg};
 use crossbeam_channel::{bounded, tick, unbounded};
 use flate2::read::ZlibDecoder;
+use geo::Point;
+use itertools::Itertools;
 use postgres::{Connection, TlsMode};
-use postgres::types::{FLOAT8, INT8, ToSql, Type};
+use postgres::types::{INT8, ToSql, Type};
 use postgres_binary_copy::BinaryCopyReader;
 use streaming_iterator::StreamingIterator;
 
@@ -58,16 +62,14 @@ fn main() {
     let mut handles = Vec::new();
 
     {
-        info!("allocating data structures...");
-
         let node_counter = Arc::new(AtomicI64::new(0));
         let (node_sender, node_receiver) = bounded(200000000);
 
         {
             let db = Connection::connect(db_url.clone(), TlsMode::None).unwrap();
-            db.execute("CREATE UNLOGGED TABLE node (id BIGINT NOT NULL, lat DOUBLE PRECISION NOT NULL, lon DOUBLE PRECISION NOT NULL)", &[]).unwrap();
-            db.execute("CREATE UNLOGGED TABLE way (id BIGINT NOT NULL)", &[]).unwrap();
-            db.execute("CREATE UNLOGGED TABLE relation (id BIGINT NOT NULL)", &[]).unwrap();
+            db.execute("CREATE UNLOGGED TABLE node (id BIGINT NOT NULL, coordinates POINT NOT NULL, tags HSTORE NOT NULL)", &[]).unwrap();
+            db.execute("CREATE UNLOGGED TABLE way (id BIGINT NOT NULL, tags HSTORE NOT NULL)", &[]).unwrap();
+            db.execute("CREATE UNLOGGED TABLE relation (id BIGINT NOT NULL, tags HSTORE NOT NULL)", &[]).unwrap();
         }
 
         for i in 1..7 {
@@ -79,10 +81,14 @@ fn main() {
                 .spawn(move || {
                     info!("node-writer {} connecting to DB...", i);
                     let db = Connection::connect(node_db_url, TlsMode::None).unwrap();
+                    let stmt = db.prepare("SELECT $1::point, $2::hstore").unwrap();
+                    let types = stmt.param_types();
+                    let point_type = types[0].clone();
+                    let hstore_type = types[1].clone();
                     copy_in(
                         &db,
-                        &[INT8, FLOAT8, FLOAT8],
-                        "COPY node (id, lat, lon) FROM STDIN (FORMAT binary)",
+                        &[INT8, point_type, hstore_type],
+                        "COPY node (id, coordinates, tags) FROM STDIN (FORMAT binary)",
                         local_node_receiver.iter()
                             .inspect(|_| { local_node_counter.fetch_add(1, Ordering::Relaxed); })
                     );
@@ -100,10 +106,12 @@ fn main() {
             .spawn(move || {
                 info!("way-writer connecting to DB...");
                 let db = Connection::connect(way_db_url, TlsMode::None).unwrap();
+                let stmt = db.prepare("SELECT $1::hstore").unwrap();
+                let hstore_type = stmt.param_types()[0].clone();
                 copy_in(
                     &db,
-                    &[INT8],
-                    "COPY way (id) FROM STDIN (FORMAT binary)",
+                    &[INT8, hstore_type],
+                    "COPY way (id, tags) FROM STDIN (FORMAT binary)",
                     way_receiver.iter()
                         .inspect(|_| { local_way_counter.fetch_add(1, Ordering::Relaxed); })
                 );
@@ -120,10 +128,12 @@ fn main() {
             .spawn(move || {
                 info!("relation-writer connecting to DB...");
                 let db = Connection::connect(relation_db_url, TlsMode::None).unwrap();
+                let stmt = db.prepare("SELECT $1::hstore").unwrap();
+                let hstore_type = stmt.param_types()[0].clone();
                 copy_in(
                     &db,
-                    &[INT8],
-                    "COPY relation (id) FROM STDIN (FORMAT binary)",
+                    &[INT8, hstore_type],
+                    "COPY relation (id, tags) FROM STDIN (FORMAT binary)",
                     relation_receiver.iter()
                         .inspect(|_| { local_relation_counter.fetch_add(1, Ordering::Relaxed); })
                 );
@@ -143,7 +153,7 @@ fn main() {
                 .name(format!("block-parser-{}", i))
                 .spawn(move || {
                     while let Ok(block) = local_block_receiver.recv() {
-                        // let strings = block.take_stringtable().take_s().into_vec();
+                        let strings = block.get_stringtable().get_s().to_vec();
                         let groups = block.get_primitivegroup();
                         let granularity = block.get_granularity();
                         let lat_offset = block.get_lat_offset();
@@ -160,49 +170,45 @@ fn main() {
                             let node_lons = decode_osm_deltas(dense.get_lon().into_iter())
                                 .map(|lon| coord(lon, lon_offset, granularity));
 
-                            // TODO https://github.com/sfackler/rust-postgres-binary-copy/issues/4
-                            //      after resolution, insert these tags (plus the way and relation tags
-                            //      below) as hstore
-                            //
-                            // let node_kvs = dense.take_keys_vals().into_iter()
-                            //     .batching(|iter| Some(
-                            //         iter.take_while(|i| *i != 0)
-                            //             .map(|i| String::from_utf8_lossy(&strings[i as usize]).into_owned())
-                            //             .tuples::<(_, _)>()
-                            //             .map(|(k, v)| (k, Some(v)))
-                            //             .collect::<HashMap<_, _>>()
-                            //     ));
-                            //
-                            // TODO insert lat/lon as a geometry POINT field
+                            let node_coords = izip!(node_lons, node_lats).map(Point::from);
 
-                            for (id, lat, lon) in izip!(node_ids, node_lats, node_lons) {
-                                let row: Vec<Box<ToSql + Send>> = vec![Box::new(id), Box::new(lat), Box::new(lon)];
+                            let node_tags = dense.get_keys_vals().into_iter()
+                                .batching(|iter| Some(
+                                    iter.take_while(|i| **i != 0)
+                                        .map(|i| String::from_utf8_lossy(&strings[*i as usize]).into_owned())
+                                        .tuples::<(_, _)>()
+                                        .map(|(k, v)| (k, Some(v)))
+                                        .collect::<HashMap<_, _>>()
+                                ));
+                           
+                            for (id, coords, tags) in izip!(node_ids, node_coords, node_tags) {
+                                let row: Vec<Box<ToSql + Send>> = vec![Box::new(id), Box::new(coords), Box::new(tags)];
                                 local_node_sender.send(row).unwrap();
                             }
 
                             for way in group.get_ways().into_iter() {
-                                // let kv: HashMap<String, Option<String>> = izip!(
-                                //     way.take_keys().into_iter()
-                                //         .map(|i| String::from_utf8_lossy(&strings[i as usize]).into_owned()),
-                                //     way.take_vals().into_iter()
-                                //         .map(|i| Some(String::from_utf8_lossy(&strings[i as usize]).into_owned())),
-                                // ).collect();
+                                let tags = izip!(
+                                    way.get_keys().into_iter()
+                                        .map(|i| String::from_utf8_lossy(&strings[*i as usize]).into_owned()),
+                                    way.get_vals().into_iter()
+                                        .map(|i| Some(String::from_utf8_lossy(&strings[*i as usize]).into_owned())),
+                                ).collect::<HashMap<_, _>>();
                                  
-                                let row: Vec<Box<ToSql + Send>> = vec![Box::new(way.get_id())];
+                                let row: Vec<Box<ToSql + Send>> = vec![Box::new(way.get_id()), Box::new(tags)];
                                 local_way_sender.send(row).unwrap();
 
                                 // TODO refs
                             }
 
                             for rel in group.get_relations().into_iter() {
-                                // let kv: HashMap<String, Option<String>> = izip!(
-                                //     rel.take_keys().into_iter()
-                                //         .map(|i| String::from_utf8_lossy(&strings[i as usize]).into_owned()),
-                                //     rel.take_vals().into_iter()
-                                //         .map(|i| Some(String::from_utf8_lossy(&strings[i as usize]).into_owned())),
-                                // ).collect();
+                                let tags = izip!(
+                                    rel.get_keys().into_iter()
+                                        .map(|i| String::from_utf8_lossy(&strings[*i as usize]).into_owned()),
+                                    rel.get_vals().into_iter()
+                                        .map(|i| Some(String::from_utf8_lossy(&strings[*i as usize]).into_owned())),
+                                ).collect::<HashMap<_, _>>();
                                 
-                                let row: Vec<Box<ToSql + Send>> = vec![Box::new(rel.get_id())];
+                                let row: Vec<Box<ToSql + Send>> = vec![Box::new(rel.get_id()), Box::new(tags)];
                                 local_relation_sender.send(row).unwrap();
 
                                 // TODO refs
@@ -292,7 +298,6 @@ fn main() {
                 block_counter.load(Ordering::Relaxed),
                 blob_counter.load(Ordering::Relaxed)
             );
-            info!("queues: nodes={}, ways={}, relations={}, blocks={}, blobs={}", node_sender.len(), way_sender.len(), relation_sender.len(), block_sender.len(), blob_sender.len());
         }
     }
 
@@ -304,10 +309,14 @@ fn main() {
     let db = Connection::connect(db_url, TlsMode::None).unwrap();
     db.execute("ALTER TABLE node SET LOGGED", &[]).unwrap();
     db.execute("ALTER TABLE node ADD PRIMARY KEY (id)", &[]).unwrap();
+    db.execute("CREATE INDEX node_coordinates USING gist ON node (coordinates)", &[]).unwrap();
+    db.execute("CREATE INDEX node_tags USING gin ON node (tags)", &[]).unwrap();
     db.execute("ALTER TABLE way SET LOGGED", &[]).unwrap();
     db.execute("ALTER TABLE way ADD PRIMARY KEY (id)", &[]).unwrap();
+    db.execute("CREATE INDEX way_tags USING gin ON way (tags)", &[]).unwrap();
     db.execute("ALTER TABLE relation SET LOGGED", &[]).unwrap();
     db.execute("ALTER TABLE relation ADD PRIMARY KEY (id)", &[]).unwrap();
+    db.execute("CREATE INDEX relation_tags USING gin ON relation (tags)", &[]).unwrap();
 
     info!("Import complete.");
 }
